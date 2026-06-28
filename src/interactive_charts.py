@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Iterable
-
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -50,11 +47,15 @@ def prepare_orders_mart(df: pd.DataFrame) -> pd.DataFrame:
         if column in result.columns:
             result[column] = pd.to_numeric(result[column], errors="coerce")
 
-    for column in ["is_bad_review", "is_delayed", "is_delivered", "is_cancelled"]:
+    for column in ["is_delivered", "is_cancelled"]:
         if column in result.columns:
             result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0).astype(int)
 
-    result["product_category_name"] = result["product_category_name"].fillna("unknown")
+    for column in ["is_bad_review", "is_delayed"]:
+        if column in result.columns:
+            result[column] = pd.to_numeric(result[column], errors="coerce")
+
+    result["product_category_name"] = result["product_category_name"].fillna("no_order_items")
     result["customer_state"] = result["customer_state"].fillna("unknown")
     result["seller_state"] = result["seller_state"].fillna("unknown")
     result["main_payment_type"] = result["main_payment_type"].fillna("unknown")
@@ -62,8 +63,16 @@ def prepare_orders_mart(df: pd.DataFrame) -> pd.DataFrame:
     if "order_purchase_timestamp" in result.columns:
         result["order_month"] = result["order_purchase_timestamp"].dt.to_period("M").dt.to_timestamp()
 
-    result["bad_review_label"] = np.where(result["is_bad_review"] == 1, "Плохой отзыв", "Не плохой отзыв")
-    result["delay_group"] = np.where(result["is_delayed"] == 1, "С задержкой", "Без задержки")
+    result["bad_review_label"] = np.select(
+        [result["is_bad_review"] == 1, result["is_bad_review"] == 0],
+        ["Плохой отзыв", "Не плохой отзыв"],
+        default="Без отзыва",
+    )
+    result["delay_group"] = np.select(
+        [result["is_delayed"] == 1, result["is_delayed"] == 0],
+        ["С задержкой", "Без задержки"],
+        default="Не доставлено",
+    )
     result["delivered_group"] = np.where(result["is_delivered"] == 1, "Доставлен", "Не доставлен")
 
     return result
@@ -325,7 +334,7 @@ def build_review_distribution_figure(df: pd.DataFrame) -> go.Figure:
 
 def build_delay_review_figure(df: pd.DataFrame) -> go.Figure:
     data = (
-        df[df["is_delivered"] == 1]
+        df[df["is_delayed"].notna()]
         .groupby("delay_group", as_index=False)
         .agg(
             orders=("order_id", "nunique"),

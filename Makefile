@@ -1,4 +1,4 @@
-PYTHON ?= py
+PYTHON ?= python3
 
 .PHONY: install data all dash dashboard test clean
 

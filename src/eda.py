@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import textwrap
 from pathlib import Path
 from typing import Iterable
@@ -206,7 +205,9 @@ def prepare_mart(df: pd.DataFrame) -> pd.DataFrame:
         if col in result.columns:
             result[col] = pd.to_numeric(result[col], errors="coerce")
 
-    for col in ["product_category_name", "customer_state", "seller_state"]:
+    if "product_category_name" in result.columns:
+        result["product_category_name"] = result["product_category_name"].fillna("no_order_items")
+    for col in ["customer_state", "seller_state"]:
         if col in result.columns:
             result[col] = result[col].fillna("unknown")
 

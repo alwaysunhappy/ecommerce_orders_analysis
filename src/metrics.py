@@ -28,10 +28,14 @@ def calculate_summary_metrics(df: pd.DataFrame) -> pd.DataFrame:
     customer_orders = df.groupby("customer_unique_id")["order_id"].nunique()
     repeat_purchase_rate = float((customer_orders > 1).mean()) if len(customer_orders) else np.nan
 
+    reviewed_mask = pd.to_numeric(df["review_count"], errors="coerce").fillna(0) > 0
+
     metrics = {
         "total_orders": len(df),
         "delivered_orders": int(df["is_delivered"].sum()),
         "cancelled_orders": int(df["is_cancelled"].sum()),
+        "reviewed_orders": int(reviewed_mask.sum()),
+        "review_coverage": float(reviewed_mask.mean()) if len(df) else np.nan,
         "gmv": float(df["total_price"].sum()),
         "aov": float(df["total_price"].mean()),
         "avg_review_score": float(pd.to_numeric(df["review_score"], errors="coerce").mean()),
