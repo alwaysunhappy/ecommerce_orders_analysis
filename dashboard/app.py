@@ -17,10 +17,15 @@ from src.interactive_charts import (
     build_payment_type_figure,
     build_review_distribution_figure,
     build_seller_customer_heatmap,
+    build_seller_quality_scatter,
+    build_seller_within_category_figure,
+    build_stage_decomposition_figure,
     build_state_experience_figure,
     build_top_category_risk_figure,
     category_metrics,
+    prepare_order_seller,
     prepare_orders_mart,
+    seller_metrics,
     state_metrics,
 )
 
@@ -36,6 +41,20 @@ def load_orders_mart() -> pd.DataFrame:
     with sqlite3.connect(DB_PATH) as conn:
         df = pd.read_sql_query("SELECT * FROM orders_mart", conn)
     return prepare_orders_mart(df)
+
+
+@st.cache_data(show_spinner=False)
+def load_order_seller() -> pd.DataFrame:
+    if not DB_PATH.exists():
+        return pd.DataFrame()
+    with sqlite3.connect(DB_PATH) as conn:
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='order_seller'"
+        ).fetchone()
+        if table is None:
+            return pd.DataFrame()
+        df = pd.read_sql_query("SELECT * FROM order_seller", conn)
+    return prepare_order_seller(df)
 
 
 def fmt_int(value: float) -> str:
@@ -105,6 +124,7 @@ st.caption(
 )
 
 orders = load_orders_mart()
+order_seller = load_order_seller()
 
 with st.sidebar:
     st.header("Фильтры")
@@ -147,19 +167,35 @@ if filtered.empty:
     st.warning("После применения фильтров не осталось данных.")
     st.stop()
 
+filtered_sellers = order_seller.copy()
+if not filtered_sellers.empty:
+    if selected_categories:
+        filtered_sellers = filtered_sellers[filtered_sellers["product_category_name"].isin(selected_categories)]
+    if selected_customer_states:
+        filtered_sellers = filtered_sellers[filtered_sellers["customer_state"].isin(selected_customer_states)]
+    if selected_seller_states:
+        filtered_sellers = filtered_sellers[filtered_sellers["seller_state"].isin(selected_seller_states)]
+    if isinstance(date_range, tuple) and len(date_range) == 2 and "order_purchase_timestamp" in filtered_sellers.columns:
+        start_date, end_date = date_range
+        filtered_sellers = filtered_sellers[
+            (filtered_sellers["order_purchase_timestamp"].dt.date >= start_date)
+            & (filtered_sellers["order_purchase_timestamp"].dt.date <= end_date)
+        ]
+
 st.subheader("Ключевые метрики")
 show_metric_cards(filtered, orders)
 
 st.divider()
 
-tab_overview, tab_quality, tab_categories, tab_geo, tab_money, tab_data = st.tabs(
+tab_overview, tab_quality, tab_categories, tab_geo, tab_sellers, tab_money, tab_data = st.tabs(
     [
         "1. Обзор",
         "2. Доставка и отзывы",
         "3. Категории",
         "4. География",
-        "5. Деньги и оплата",
-        "6. Данные",
+        "5. Продавцы",
+        "6. Деньги и оплата",
+        "7. Данные",
     ]
 )
 
@@ -205,6 +241,46 @@ with tab_geo:
     st.subheader("Таблица регионов покупателей")
     st.dataframe(state_table, use_container_width=True)
     make_download_button(state_table, "customer_state_metrics_interactive.csv", "Скачать таблицу регионов")
+
+with tab_sellers:
+    if filtered_sellers.empty:
+        st.info("Витрина продавцов недоступна. Запустите пайплайн: `make all`.")
+    else:
+        seller_min_orders = max(10, min_orders // 2)
+        st.plotly_chart(
+            build_stage_decomposition_figure(filtered_sellers),
+            use_container_width=True,
+            config=PLOTLY_CONFIG,
+            key='stage_decomposition_chart',
+        )
+        st.plotly_chart(
+            build_seller_quality_scatter(filtered_sellers, min_orders=seller_min_orders),
+            use_container_width=True,
+            config=PLOTLY_CONFIG,
+            key='seller_quality_scatter_chart',
+        )
+        st.plotly_chart(
+            build_seller_within_category_figure(filtered_sellers, min_orders=seller_min_orders),
+            use_container_width=True,
+            config=PLOTLY_CONFIG,
+            key='seller_within_category_chart',
+        )
+
+        seller_table = seller_metrics(filtered_sellers, min_orders=seller_min_orders).sort_values(
+            "bad_review_rate", ascending=False
+        )
+        st.subheader("Таблица продавцов")
+        st.dataframe(
+            seller_table,
+            use_container_width=True,
+            column_config={
+                "bad_review_rate": st.column_config.ProgressColumn("bad_review_rate", format="%.2f", min_value=0, max_value=1),
+                "delay_rate": st.column_config.ProgressColumn("delay_rate", format="%.2f", min_value=0, max_value=1),
+                "late_handover_rate": st.column_config.ProgressColumn("late_handover_rate", format="%.2f", min_value=0, max_value=1),
+                "gmv": st.column_config.NumberColumn("gmv", format="%.0f"),
+            },
+        )
+        make_download_button(seller_table, "seller_metrics_interactive.csv", "Скачать таблицу продавцов")
 
 with tab_money:
     col1, col2 = st.columns(2)

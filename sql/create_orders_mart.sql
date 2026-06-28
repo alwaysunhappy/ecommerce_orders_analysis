@@ -16,6 +16,7 @@ WITH item_with_category AS (
         oi.seller_id,
         CAST(oi.price AS REAL) AS price,
         CAST(oi.freight_value AS REAL) AS freight_value,
+        oi.shipping_limit_date,
         CASE
             WHEN p.product_category_name IS NULL OR p.product_category_name = ''
                 THEN 'missing_product_category'
@@ -40,7 +41,8 @@ order_totals AS (
         COUNT(DISTINCT seller_id) AS distinct_sellers,
         COUNT(DISTINCT product_category_name) AS distinct_categories,
         SUM(price) AS total_price,
-        SUM(freight_value) AS total_freight
+        SUM(freight_value) AS total_freight,
+        MAX(shipping_limit_date) AS max_shipping_limit_date
     FROM item_with_category
     GROUP BY order_id
 ),
@@ -60,17 +62,18 @@ main_category AS (
     WHERE rn = 1
 ),
 main_seller AS (
-    SELECT order_id, seller_state
+    SELECT order_id, seller_id, seller_state
     FROM (
         SELECT
             order_id,
+            seller_id,
             seller_state,
             ROW_NUMBER() OVER (
                 PARTITION BY order_id
-                ORDER BY SUM(price) DESC, seller_state
+                ORDER BY SUM(price) DESC, seller_id
             ) AS rn
         FROM item_with_category
-        GROUP BY order_id, seller_state
+        GROUP BY order_id, seller_id, seller_state
     )
     WHERE rn = 1
 )
@@ -82,7 +85,9 @@ SELECT
     ot.distinct_categories,
     ot.total_price,
     ot.total_freight,
+    ot.max_shipping_limit_date,
     mc.product_category_name,
+    ms.seller_id AS main_seller_id,
     ms.seller_state,
     CASE WHEN ot.distinct_categories > 1 THEN 1 ELSE 0 END AS is_mixed_category
 FROM order_totals AS ot
@@ -151,6 +156,7 @@ SELECT
 
     c.customer_city,
     c.customer_state,
+    ia.main_seller_id,
     ia.seller_state,
     CASE
         WHEN ia.order_id IS NULL THEN 'no_order_items'
@@ -217,7 +223,36 @@ SELECT
         WHEN COALESCE(ia.total_price, 0.0) > 0
         THEN COALESCE(ia.total_freight, 0.0) / COALESCE(ia.total_price, 0.0)
         ELSE NULL
-    END AS freight_share
+    END AS freight_share,
+
+    CASE
+        WHEN o.order_approved_at IS NOT NULL AND o.order_approved_at != ''
+        THEN julianday(o.order_approved_at) - julianday(o.order_purchase_timestamp)
+        ELSE NULL
+    END AS approval_time_days,
+
+    CASE
+        WHEN o.order_delivered_carrier_date IS NOT NULL AND o.order_delivered_carrier_date != ''
+             AND o.order_approved_at IS NOT NULL AND o.order_approved_at != ''
+        THEN julianday(o.order_delivered_carrier_date) - julianday(o.order_approved_at)
+        ELSE NULL
+    END AS handover_time_days,
+
+    CASE
+        WHEN o.order_delivered_customer_date IS NOT NULL AND o.order_delivered_customer_date != ''
+             AND o.order_delivered_carrier_date IS NOT NULL AND o.order_delivered_carrier_date != ''
+        THEN julianday(o.order_delivered_customer_date) - julianday(o.order_delivered_carrier_date)
+        ELSE NULL
+    END AS transit_time_days,
+
+    CASE
+        WHEN o.order_delivered_carrier_date IS NULL OR o.order_delivered_carrier_date = ''
+             OR ia.max_shipping_limit_date IS NULL OR ia.max_shipping_limit_date = ''
+        THEN NULL
+        WHEN julianday(o.order_delivered_carrier_date) > julianday(ia.max_shipping_limit_date)
+        THEN 1
+        ELSE 0
+    END AS is_late_handover
 
 FROM raw_orders AS o
 LEFT JOIN raw_customers AS c
@@ -233,3 +268,4 @@ CREATE INDEX IF NOT EXISTS idx_orders_mart_order_id ON orders_mart(order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_mart_month ON orders_mart(order_year_month);
 CREATE INDEX IF NOT EXISTS idx_orders_mart_category ON orders_mart(product_category_name);
 CREATE INDEX IF NOT EXISTS idx_orders_mart_customer_state ON orders_mart(customer_state);
+CREATE INDEX IF NOT EXISTS idx_orders_mart_seller_id ON orders_mart(main_seller_id);

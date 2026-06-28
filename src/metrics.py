@@ -10,11 +10,49 @@ import pandas as pd
 from src.config import DB_PATH, TABLES_DIR, ensure_directories
 
 
+Z95 = 1.959963984540054
+
+
 def read_mart(db_path: Path = DB_PATH) -> pd.DataFrame:
     if not db_path.exists():
         raise FileNotFoundError(f"Database not found: {db_path}")
     with sqlite3.connect(db_path) as conn:
         return pd.read_sql_query("SELECT * FROM orders_mart", conn)
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone()
+    return row is not None
+
+
+def read_seller_mart(db_path: Path = DB_PATH) -> pd.DataFrame:
+    if not db_path.exists():
+        raise FileNotFoundError(f"Database not found: {db_path}")
+    with sqlite3.connect(db_path) as conn:
+        if not _table_exists(conn, "seller_mart"):
+            return pd.DataFrame()
+        return pd.read_sql_query("SELECT * FROM seller_mart", conn)
+
+
+def read_order_seller(db_path: Path = DB_PATH) -> pd.DataFrame:
+    if not db_path.exists():
+        raise FileNotFoundError(f"Database not found: {db_path}")
+    with sqlite3.connect(db_path) as conn:
+        if not _table_exists(conn, "order_seller"):
+            return pd.DataFrame()
+        return pd.read_sql_query("SELECT * FROM order_seller", conn)
+
+
+def _wilson_ci(success: float, n: int, z: float = Z95) -> tuple[float, float]:
+    if n == 0:
+        return (np.nan, np.nan)
+    p = success / n
+    denom = 1 + z ** 2 / n
+    center = (p + z ** 2 / (2 * n)) / denom
+    half = z * np.sqrt(p * (1 - p) / n + z ** 2 / (4 * n ** 2)) / denom
+    return (center - half, center + half)
 
 
 def _safe_rate(series: pd.Series) -> float:
@@ -69,6 +107,114 @@ def aggregate_segment(df: pd.DataFrame, group_col: str, min_orders: int = 30) ->
     return result.sort_values(["bad_review_rate", "orders"], ascending=[False, False]).round(4)
 
 
+def aggregate_sellers(seller_df: pd.DataFrame, min_orders: int = 30) -> pd.DataFrame:
+    if seller_df.empty:
+        return seller_df
+    columns = [
+        "seller_id",
+        "seller_state",
+        "top_category",
+        "orders",
+        "items",
+        "single_seller_orders",
+        "distinct_categories",
+        "gmv",
+        "delay_rate",
+        "late_handover_rate",
+        "bad_review_rate",
+        "avg_review_score",
+        "review_coverage",
+        "avg_delivery_time_days",
+        "avg_handover_time_days",
+        "avg_transit_time_days",
+    ]
+    existing = [column for column in columns if column in seller_df.columns]
+    result = seller_df[existing].copy()
+    result = result[result["orders"] >= min_orders]
+    return result.sort_values(["bad_review_rate", "orders"], ascending=[False, False]).round(4)
+
+
+def seller_within_category_comparison(
+    order_seller_df: pd.DataFrame,
+    min_seller_orders: int = 30,
+    min_sellers: int = 3,
+    single_seller_only: bool = True,
+) -> pd.DataFrame:
+    if order_seller_df.empty:
+        return pd.DataFrame()
+
+    df = order_seller_df.copy()
+    if single_seller_only and "is_single_seller_order" in df.columns:
+        df = df[pd.to_numeric(df["is_single_seller_order"], errors="coerce") == 1]
+
+    for column in ["is_bad_review", "is_delayed", "is_late_handover", "review_score",
+                   "avg_handover_time_days", "handover_time_days", "transit_time_days"]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    reviewed = df[df["is_bad_review"].notna()]
+    if reviewed.empty:
+        return pd.DataFrame()
+
+    category_rate = reviewed.groupby("product_category_name")["is_bad_review"].mean()
+
+    per_seller = (
+        reviewed.groupby(["product_category_name", "seller_id"])
+        .agg(
+            orders=("order_id", "nunique"),
+            bad_reviews=("is_bad_review", "sum"),
+            bad_review_rate=("is_bad_review", "mean"),
+            avg_review_score=("review_score", "mean"),
+            delay_rate=("is_delayed", "mean"),
+            late_handover_rate=("is_late_handover", "mean"),
+            avg_handover_time_days=("handover_time_days", "mean"),
+            avg_transit_time_days=("transit_time_days", "mean"),
+        )
+        .reset_index()
+    )
+    per_seller = per_seller[per_seller["orders"] >= min_seller_orders]
+    if per_seller.empty:
+        return pd.DataFrame()
+
+    seller_counts = per_seller.groupby("product_category_name")["seller_id"].transform("size")
+    per_seller = per_seller[seller_counts >= min_sellers]
+    if per_seller.empty:
+        return pd.DataFrame()
+
+    per_seller["category_bad_review_rate"] = per_seller["product_category_name"].map(category_rate)
+    per_seller["bad_review_rate_diff"] = per_seller["bad_review_rate"] - per_seller["category_bad_review_rate"]
+    per_seller["n_sellers_in_category"] = per_seller.groupby("product_category_name")["seller_id"].transform("size")
+
+    ci = per_seller.apply(
+        lambda row: _wilson_ci(float(row["bad_reviews"]), int(row["orders"])),
+        axis=1,
+        result_type="expand",
+    )
+    per_seller["bad_review_rate_ci_low"] = ci[0]
+    per_seller["bad_review_rate_ci_high"] = ci[1]
+
+    ordered_columns = [
+        "product_category_name",
+        "seller_id",
+        "n_sellers_in_category",
+        "orders",
+        "bad_review_rate",
+        "bad_review_rate_ci_low",
+        "bad_review_rate_ci_high",
+        "category_bad_review_rate",
+        "bad_review_rate_diff",
+        "delay_rate",
+        "late_handover_rate",
+        "avg_review_score",
+        "avg_handover_time_days",
+        "avg_transit_time_days",
+    ]
+    per_seller = per_seller[ordered_columns]
+    return per_seller.sort_values(
+        ["product_category_name", "bad_review_rate_diff"], ascending=[True, False]
+    ).round(4)
+
+
 def calculate_monthly_metrics(df: pd.DataFrame) -> pd.DataFrame:
     result = (
         df.groupby("order_year_month")
@@ -99,6 +245,16 @@ def save_metrics(db_path: Path = DB_PATH, output_dir: Path = TABLES_DIR) -> None
         "seller_state_metrics.csv": aggregate_segment(df, "seller_state", min_orders=30),
         "monthly_metrics.csv": calculate_monthly_metrics(df),
     }
+
+    seller_df = read_seller_mart(db_path)
+    seller_metrics = aggregate_sellers(seller_df, min_orders=30)
+    if not seller_metrics.empty:
+        outputs["seller_metrics.csv"] = seller_metrics
+
+    order_seller_df = read_order_seller(db_path)
+    seller_comparison = seller_within_category_comparison(order_seller_df)
+    if not seller_comparison.empty:
+        outputs["seller_category_comparison.csv"] = seller_comparison
 
     for filename, table in outputs.items():
         path = output_dir / filename

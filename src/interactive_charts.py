@@ -665,6 +665,224 @@ def build_seller_customer_heatmap(df: pd.DataFrame, min_orders: int = 30) -> go.
     )
 
 
+def prepare_order_seller(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+
+    if "order_purchase_timestamp" in result.columns:
+        result["order_purchase_timestamp"] = pd.to_datetime(result["order_purchase_timestamp"], errors="coerce")
+
+    for column in [
+        "seller_price",
+        "seller_freight",
+        "seller_item_count",
+        "review_score",
+        "delivery_time_days",
+        "handover_time_days",
+        "transit_time_days",
+    ]:
+        if column in result.columns:
+            result[column] = pd.to_numeric(result[column], errors="coerce")
+
+    for column in ["is_delivered", "is_cancelled", "is_single_seller_order"]:
+        if column in result.columns:
+            result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0).astype(int)
+
+    for column in ["is_bad_review", "is_delayed", "is_late_handover", "has_review"]:
+        if column in result.columns:
+            result[column] = pd.to_numeric(result[column], errors="coerce")
+
+    for column in ["product_category_name", "seller_state", "customer_state"]:
+        if column in result.columns:
+            result[column] = result[column].fillna("unknown")
+
+    return result
+
+
+def seller_metrics(df: pd.DataFrame, min_orders: int = 30) -> pd.DataFrame:
+    if df.empty:
+        return df
+    result = (
+        df.groupby("seller_id", as_index=False)
+        .agg(
+            orders=("order_id", "nunique"),
+            gmv=("seller_price", "sum"),
+            seller_state=("seller_state", "first"),
+            delay_rate=("is_delayed", "mean"),
+            late_handover_rate=("is_late_handover", "mean"),
+            bad_review_rate=("is_bad_review", "mean"),
+            avg_review_score=("review_score", "mean"),
+            avg_handover_time_days=("handover_time_days", "mean"),
+            avg_transit_time_days=("transit_time_days", "mean"),
+        )
+    )
+    result = result[result["orders"] >= min_orders]
+    return _clean_for_plot(result)
+
+
+def seller_within_category(df: pd.DataFrame, min_orders: int = 30, min_sellers: int = 3, top_categories: int = 6) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    data = df.copy()
+    if "is_single_seller_order" in data.columns:
+        data = data[data["is_single_seller_order"] == 1]
+    reviewed = data[data["is_bad_review"].notna()]
+    if reviewed.empty:
+        return pd.DataFrame()
+
+    per_seller = (
+        reviewed.groupby(["product_category_name", "seller_id"], as_index=False)
+        .agg(
+            orders=("order_id", "nunique"),
+            bad_review_rate=("is_bad_review", "mean"),
+            delay_rate=("is_delayed", "mean"),
+            avg_review_score=("review_score", "mean"),
+        )
+    )
+    per_seller = per_seller[per_seller["orders"] >= min_orders]
+    if per_seller.empty:
+        return pd.DataFrame()
+
+    counts = per_seller.groupby("product_category_name")["seller_id"].transform("size")
+    per_seller = per_seller[counts >= min_sellers]
+    if per_seller.empty:
+        return pd.DataFrame()
+
+    category_volume = per_seller.groupby("product_category_name")["orders"].sum().sort_values(ascending=False)
+    keep = category_volume.head(top_categories).index
+    per_seller = per_seller[per_seller["product_category_name"].isin(keep)]
+    return _clean_for_plot(per_seller)
+
+
+def build_seller_quality_scatter(df: pd.DataFrame, min_orders: int = 30) -> go.Figure:
+    data = seller_metrics(df, min_orders=min_orders)
+    if data.empty:
+        return add_title(go.Figure(), "Качество продавцов", "Недостаточно данных для выбранного порога заказов.")
+
+    avg_delay = _safe_mean(df[df["is_delivered"] == 1]["is_delayed"])
+    avg_bad = _safe_mean(df["is_bad_review"])
+
+    fig = px.scatter(
+        data,
+        x="delay_rate",
+        y="bad_review_rate",
+        size="orders",
+        color="avg_review_score",
+        color_continuous_scale=[[0, COLOR_BAD], [0.5, COLOR_ACCENT], [1, COLOR_GOOD]],
+        hover_name="seller_id",
+        hover_data={
+            "orders": ":,.0f",
+            "gmv": ":,.0f",
+            "delay_rate": ":.1%",
+            "late_handover_rate": ":.1%",
+            "bad_review_rate": ":.1%",
+            "avg_review_score": ":.2f",
+            "seller_state": True,
+        },
+        size_max=44,
+    )
+    fig.add_vline(
+        x=avg_delay,
+        line_dash="dash",
+        line_color=COLOR_BAD,
+        annotation_text=f"Средняя задержка: {avg_delay:.1%}",
+        annotation_position="top right",
+    )
+    fig.add_hline(
+        y=avg_bad,
+        line_dash="dash",
+        line_color=COLOR_MUTED,
+        annotation_text=f"Средние плохие отзывы: {avg_bad:.1%}",
+        annotation_position="bottom left",
+    )
+    fig.update_xaxes(title_text="Доля задержанных доставок", tickformat=".0%")
+    fig.update_yaxes(title_text="Доля плохих отзывов", tickformat=".0%")
+    fig.update_layout(coloraxis_colorbar={"title": "Средняя оценка"})
+    return add_title(
+        fig,
+        "Качество продавцов: задержки и плохие отзывы",
+        "Каждая точка — продавец. Размер — число заказов.",
+    )
+
+
+def build_stage_decomposition_figure(df: pd.DataFrame) -> go.Figure:
+    data = df[df["is_delivered"] == 1].copy()
+    if data.empty:
+        return add_title(go.Figure(), "Этапы доставки", "Нет доставленных заказов для выбранных фильтров.")
+    data["delay_group"] = np.where(data["is_delayed"] == 1, "С задержкой", "Без задержки")
+    agg = (
+        data.groupby("delay_group", as_index=False)
+        .agg(
+            handover=("handover_time_days", "mean"),
+            transit=("transit_time_days", "mean"),
+            orders=("order_id", "nunique"),
+        )
+    )
+    order = ["Без задержки", "С задержкой"]
+    agg["delay_group"] = pd.Categorical(agg["delay_group"], categories=order, ordered=True)
+    agg = agg.sort_values("delay_group")
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=agg["delay_group"].astype(str),
+            y=agg["handover"],
+            name="До передачи перевозчику (зона продавца)",
+            marker_color=COLOR_ACCENT,
+            text=agg["handover"].map(lambda x: f"{x:.1f} дн."),
+            textposition="outside",
+            hovertemplate="%{x}<br>Передача перевозчику: %{y:.1f} дней<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=agg["delay_group"].astype(str),
+            y=agg["transit"],
+            name="От перевозчика до клиента (зона транспорта)",
+            marker_color=COLOR_NEUTRAL,
+            text=agg["transit"].map(lambda x: f"{x:.1f} дн."),
+            textposition="outside",
+            hovertemplate="%{x}<br>Транспортировка: %{y:.1f} дней<extra></extra>",
+        )
+    )
+    fig.update_layout(barmode="group")
+    fig.update_yaxes(title_text="Среднее время этапа, дней")
+    fig.update_xaxes(title_text="Статус доставки")
+    return add_title(
+        fig,
+        "Декомпозиция времени доставки по этапам",
+        "Где копится задержка: на стороне продавца или в транспортировке.",
+    )
+
+
+def build_seller_within_category_figure(df: pd.DataFrame, min_orders: int = 30, min_sellers: int = 3, top_categories: int = 6) -> go.Figure:
+    data = seller_within_category(df, min_orders=min_orders, min_sellers=min_sellers, top_categories=top_categories)
+    if data.empty:
+        return add_title(
+            go.Figure(),
+            "Разброс продавцов внутри категорий",
+            "Недостаточно продавцов с нужным числом заказов в категориях.",
+        )
+    order = (
+        data.groupby("product_category_name")["bad_review_rate"].median().sort_values(ascending=False).index.tolist()
+    )
+    fig = px.box(
+        data,
+        x="product_category_name",
+        y="bad_review_rate",
+        points="all",
+        category_orders={"product_category_name": order},
+        hover_data={"seller_id": True, "orders": ":,.0f", "bad_review_rate": ":.1%"},
+    )
+    fig.update_traces(marker_color=COLOR_NEUTRAL, marker_size=7)
+    fig.update_yaxes(title_text="Доля плохих отзывов у продавца", tickformat=".0%")
+    fig.update_xaxes(title_text="Категория")
+    return add_title(
+        fig,
+        "Разброс продавцов внутри категорий",
+        "Широкий разброс точек - проблема в отдельных продавцах, а не во всей категории.",
+    )
+
+
 def build_all_figures(df: pd.DataFrame, min_orders: int = 50, top_n: int = 15) -> dict[str, go.Figure]:
     return {
         "01_monthly_overview": build_monthly_overview_figure(df),

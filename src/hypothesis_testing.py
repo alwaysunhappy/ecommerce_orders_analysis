@@ -8,7 +8,7 @@ import pandas as pd
 from scipy import stats
 
 from src.config import DB_PATH, TABLES_DIR, ensure_directories
-from src.metrics import read_mart
+from src.metrics import read_mart, read_order_seller
 
 Z95 = 1.959963984540054
 EFFECT_LABELS = ["незначимый", "слабый", "умеренный", "сильный"]
@@ -94,6 +94,63 @@ def _interpret(row: pd.Series) -> str:
         f"После поправки BH: {base} (p_adj={row['p_value_adjusted']:.4g}); "
         f"эффект {row['effect_magnitude']} ({row['effect_size_name']}={row['effect_size']:.3g})"
     )
+
+
+def run_seller_within_category_tests(
+    order_seller_df: pd.DataFrame,
+    output_dir: Path = TABLES_DIR,
+    min_seller_orders: int = 30,
+    min_sellers: int = 3,
+    single_seller_only: bool = True,
+) -> pd.DataFrame:
+    if order_seller_df.empty:
+        return pd.DataFrame()
+
+    df = order_seller_df.copy()
+    if single_seller_only and "is_single_seller_order" in df.columns:
+        df = df[pd.to_numeric(df["is_single_seller_order"], errors="coerce") == 1]
+    df["is_bad_review"] = pd.to_numeric(df["is_bad_review"], errors="coerce")
+    reviewed = df[df["is_bad_review"].notna()]
+    if reviewed.empty:
+        return pd.DataFrame()
+
+    rows: list[dict[str, object]] = []
+    for category, group in reviewed.groupby("product_category_name"):
+        seller_orders = group.groupby("seller_id")["order_id"].nunique()
+        eligible_sellers = seller_orders[seller_orders >= min_seller_orders].index
+        if len(eligible_sellers) < min_sellers:
+            continue
+        focal = group[group["seller_id"].isin(eligible_sellers)]
+        contingency = pd.crosstab(focal["seller_id"], focal["is_bad_review"])
+        if contingency.shape[0] < 2 or contingency.shape[1] != 2:
+            continue
+        chi2, p, _, _ = stats.chi2_contingency(contingency)
+        n = int(contingency.to_numpy().sum())
+        v = _cramers_v(chi2, n, contingency.shape[0], contingency.shape[1])
+        seller_rates = focal.groupby("seller_id")["is_bad_review"].mean()
+        rows.append({
+            "product_category_name": category,
+            "n_sellers": int(len(eligible_sellers)),
+            "n_observations": n,
+            "category_bad_review_rate": float(focal["is_bad_review"].mean()),
+            "min_seller_bad_review_rate": float(seller_rates.min()),
+            "max_seller_bad_review_rate": float(seller_rates.max()),
+            "statistic": float(chi2),
+            "effect_size_name": "Cramér's V",
+            "effect_size": v,
+            "effect_magnitude": _magnitude(v),
+            "p_value": _format_pvalue(p),
+        })
+
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result["p_value_adjusted"] = _benjamini_hochberg(result["p_value"].to_numpy())
+        result["significant"] = result["p_value_adjusted"] < 0.05
+        result = result.sort_values("n_observations", ascending=False).round(6)
+        path = output_dir / "seller_within_category_tests.csv"
+        result.to_csv(path, index=False)
+        print(f"Saved {path}")
+    return result
 
 
 def run_hypothesis_tests(db_path: Path = DB_PATH, output_dir: Path = TABLES_DIR) -> pd.DataFrame:
@@ -242,6 +299,61 @@ def run_hypothesis_tests(db_path: Path = DB_PATH, output_dir: Path = TABLES_DIR)
             "effect_size": v,
             "effect_magnitude": _magnitude(v),
             "p_value": _format_pvalue(p),
+        })
+
+    h7 = df[df["is_late_handover"].notna() & df["is_bad_review"].notna()].copy()
+    if not h7.empty:
+        h7["is_late_handover"] = pd.to_numeric(h7["is_late_handover"], errors="coerce").astype(int)
+        contingency_h7 = pd.crosstab(h7["is_late_handover"], h7["is_bad_review"])
+        if contingency_h7.shape == (2, 2):
+            chi2, p, _, _ = stats.chi2_contingency(contingency_h7)
+            n = int(contingency_h7.to_numpy().sum())
+            late = h7.loc[h7["is_late_handover"] == 1, "is_bad_review"]
+            on_time = h7.loc[h7["is_late_handover"] == 0, "is_bad_review"]
+            ci_late = _wilson_ci(float(late.sum()), len(late))
+            ci_on_time = _wilson_ci(float(on_time.sum()), len(on_time))
+            v = _cramers_v(chi2, n, 2, 2)
+            rows.append({
+                "hypothesis": "H7: поздняя передача перевозчику (зона продавца) связана с плохим отзывом",
+                "test": "chi-square test of independence",
+                "scope": "заказы с отзывом и известным фактом просрочки отгрузки",
+                "metric_1": "bad_review_rate_late_handover",
+                "value_1": float(late.mean()),
+                "ci_low_1": ci_late[0],
+                "ci_high_1": ci_late[1],
+                "metric_2": "bad_review_rate_on_time_handover",
+                "value_2": float(on_time.mean()),
+                "ci_low_2": ci_on_time[0],
+                "ci_high_2": ci_on_time[1],
+                "n_observations": n,
+                "statistic": chi2,
+                "effect_size_name": "Cramér's V",
+                "effect_size": v,
+                "effect_magnitude": _magnitude(v),
+                "p_value": _format_pvalue(p),
+            })
+
+    seller_tests = run_seller_within_category_tests(read_order_seller(db_path), output_dir)
+    if not seller_tests.empty:
+        focal = seller_tests.iloc[0]
+        rows.append({
+            "hypothesis": "H6: внутри категории продавцы различаются по доле плохих отзывов",
+            "test": "chi-square test of independence",
+            "scope": f"single-seller заказы с отзывом, фокусная категория {focal['product_category_name']} (>= 30 заказов на продавца)",
+            "metric_1": "n_sellers",
+            "value_1": int(focal["n_sellers"]),
+            "ci_low_1": np.nan,
+            "ci_high_1": np.nan,
+            "metric_2": "category_bad_review_rate",
+            "value_2": float(focal["category_bad_review_rate"]),
+            "ci_low_2": float(focal["min_seller_bad_review_rate"]),
+            "ci_high_2": float(focal["max_seller_bad_review_rate"]),
+            "n_observations": int(focal["n_observations"]),
+            "statistic": float(focal["statistic"]),
+            "effect_size_name": "Cramér's V",
+            "effect_size": float(focal["effect_size"]),
+            "effect_magnitude": focal["effect_magnitude"],
+            "p_value": _format_pvalue(float(focal["p_value"])),
         })
 
     result = pd.DataFrame(rows)
