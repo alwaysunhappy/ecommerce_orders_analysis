@@ -252,7 +252,24 @@ SELECT
         WHEN julianday(o.order_delivered_carrier_date) > julianday(ia.max_shipping_limit_date)
         THEN 1
         ELSE 0
-    END AS is_late_handover
+    END AS is_late_handover,
+
+    CASE
+        WHEN o.order_delivered_carrier_date IS NOT NULL AND o.order_delivered_carrier_date != ''
+             AND ia.max_shipping_limit_date IS NOT NULL AND ia.max_shipping_limit_date != ''
+        THEN julianday(o.order_delivered_carrier_date) - julianday(ia.max_shipping_limit_date)
+        ELSE NULL
+    END AS seller_overrun_days,
+
+    CASE
+        WHEN o.order_delivered_customer_date IS NOT NULL AND o.order_delivered_customer_date != ''
+             AND o.order_delivered_carrier_date IS NOT NULL AND o.order_delivered_carrier_date != ''
+            AND o.order_estimated_delivery_date IS NOT NULL AND o.order_estimated_delivery_date != ''
+             AND ia.max_shipping_limit_date IS NOT NULL AND ia.max_shipping_limit_date != ''
+        THEN (julianday(o.order_delivered_customer_date) - julianday(o.order_delivered_carrier_date))
+             - (julianday(o.order_estimated_delivery_date) - julianday(ia.max_shipping_limit_date))
+        ELSE NULL
+    END AS transit_overrun_days
 
 FROM raw_orders AS o
 LEFT JOIN raw_customers AS c

@@ -9,6 +9,8 @@ import streamlit as st
 from src.interactive_charts import (
     PLOTLY_CONFIG,
     build_category_priority_figure,
+    build_delay_attribution_figure,
+    build_delay_bucket_figure,
     build_delay_review_figure,
     build_freight_share_figure,
     build_gmv_monthly_figure,
@@ -215,6 +217,8 @@ with tab_quality:
     with col2:
         st.plotly_chart(build_freight_share_figure(filtered), use_container_width=True, config=PLOTLY_CONFIG, key='freight_share_delay_tab_chart')
 
+    st.plotly_chart(build_delay_bucket_figure(filtered), use_container_width=True, config=PLOTLY_CONFIG, key='delay_bucket_chart')
+
 with tab_categories:
     st.plotly_chart(build_category_priority_figure(filtered, min_orders=min_orders), use_container_width=True, config=PLOTLY_CONFIG, key='category_priority_chart')
     st.plotly_chart(build_top_category_risk_figure(filtered, min_orders=min_orders, top_n=top_n), use_container_width=True, config=PLOTLY_CONFIG, key='top_category_risk_chart')
@@ -247,6 +251,12 @@ with tab_sellers:
         st.info("Витрина продавцов недоступна. Запустите пайплайн: `make all`.")
     else:
         seller_min_orders = max(10, min_orders // 2)
+        st.plotly_chart(
+            build_delay_attribution_figure(filtered),
+            use_container_width=True,
+            config=PLOTLY_CONFIG,
+            key='delay_attribution_chart',
+        )
         st.plotly_chart(
             build_stage_decomposition_figure(filtered_sellers),
             use_container_width=True,

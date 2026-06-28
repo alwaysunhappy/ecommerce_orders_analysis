@@ -11,7 +11,7 @@ import pandas as pd
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 
 from src.config import DB_PATH, FIGURES_DIR, ensure_directories
-from src.metrics import read_mart
+from src.metrics import delay_bucket_metrics, delay_stage_breakdown, read_mart
 
 BRAND = "#1F4E79"
 BRAND_LIGHT = "#D9EAF7"
@@ -92,7 +92,7 @@ def int_formatter(x: float, _pos: int | None = None) -> str:
 
 def fmt_int(x: float | int | np.integer | None) -> str:
     if x is None or pd.isna(x):
-        return "—"
+        return "-"
     x = float(x)
     if abs(x) >= 1_000_000:
         return f"{x / 1_000_000:.1f} млн"
@@ -103,7 +103,7 @@ def fmt_int(x: float | int | np.integer | None) -> str:
 
 def fmt_money(x: float | int | None) -> str:
     if x is None or pd.isna(x):
-        return "—"
+        return "-"
     x = float(x)
     if abs(x) >= 1_000_000:
         return f"{x / 1_000_000:.1f} млн"
@@ -114,7 +114,7 @@ def fmt_money(x: float | int | None) -> str:
 
 def fmt_pct(x: float | None, digits: int = 1) -> str:
     if x is None or pd.isna(x):
-        return "—"
+        return "-"
     return f"{float(x) * 100:.{digits}f}%"
 
 
@@ -779,6 +779,64 @@ def plot_state_experience_matrix(df: pd.DataFrame, output_dir: Path, min_orders:
     savefig(output_dir / "11_state_experience_matrix.png")
 
 
+def plot_delay_buckets(df: pd.DataFrame, output_dir: Path) -> None:
+    data = delay_bucket_metrics(df)
+    if data.empty:
+        return
+
+    rates = data["bad_review_rate"] * 100
+    err_plus = (data["bad_review_rate_ci_high"] - data["bad_review_rate"]).clip(lower=0) * 100
+    err_minus = (data["bad_review_rate"] - data["bad_review_rate_ci_low"]).clip(lower=0) * 100
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    colors = [POSITIVE if bucket == "Нет задержки" else NEGATIVE for bucket in data["delay_bucket"]]
+    bars = ax.bar(
+        data["delay_bucket"].astype(str),
+        rates,
+        color=colors,
+        width=0.62,
+        yerr=[err_minus, err_plus],
+        capsize=4,
+        ecolor=NEUTRAL,
+    )
+
+    add_title(ax, "Доля плохих отзывов по длительности задержки")
+    ax.set_xlabel("Длительность задержки")
+    ax.set_ylabel("Доля плохих отзывов")
+    ax.yaxis.set_major_formatter(FuncFormatter(pct_formatter))
+    ax.set_ylim(0, min(100, max(rates.max() * 1.3, 5)))
+    clean_axes(ax)
+
+    labels = [f"{rate:.1f}%\nn={fmt_int(n)}" for rate, n in zip(rates.values, data["reviewed_orders"].values)]
+    add_bar_labels(ax, bars, labels=labels, fontsize=9, padding=6)
+    savefig(output_dir / "12_bad_review_rate_by_delay_bucket.png")
+
+
+def plot_delay_attribution(df: pd.DataFrame, output_dir: Path) -> None:
+    data = delay_stage_breakdown(df)
+    if data.empty:
+        return
+
+    shares = data["share_of_delayed"] * 100
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    bars = ax.bar(data["delay_stage"].astype(str), shares, color=BRAND, width=0.6)
+
+    add_title(ax, "Источник задержки: продавец или транспорт")
+    ax.set_xlabel("Этап-источник задержки")
+    ax.set_ylabel("Доля задержанных заказов")
+    ax.yaxis.set_major_formatter(FuncFormatter(pct_formatter))
+    ax.set_ylim(0, max(shares.max() * 1.3, 5))
+    clean_axes(ax)
+
+    labels = [
+        f"{share:.0f}%\nплохих {rate * 100:.0f}%"
+        for share, rate in zip(shares.values, data["bad_review_rate"].values)
+    ]
+    add_bar_labels(ax, bars, labels=labels, fontsize=9, padding=6)
+    ax.set_xticklabels(wrap_labels(data["delay_stage"], 16))
+    savefig(output_dir / "13_delay_attribution_by_stage.png")
+
+
 def make_figures(db_path: Path = DB_PATH, output_dir: Path = FIGURES_DIR) -> None:
     ensure_directories()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -792,6 +850,8 @@ def make_figures(db_path: Path = DB_PATH, output_dir: Path = FIGURES_DIR) -> Non
     plot_monthly_metrics(df, output_dir)
     plot_category_impact_matrix(df, output_dir)
     plot_state_experience_matrix(df, output_dir)
+    plot_delay_buckets(df, output_dir)
+    plot_delay_attribution(df, output_dir)
 
 
 def main() -> None:

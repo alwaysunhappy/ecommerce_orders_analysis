@@ -8,7 +8,12 @@ import pandas as pd
 from scipy import stats
 
 from src.config import DB_PATH, TABLES_DIR, ensure_directories
-from src.metrics import read_mart, read_order_seller
+from src.metrics import (
+    DELAY_BUCKET_LABELS,
+    delay_bucket_series,
+    read_mart,
+    read_order_seller,
+)
 
 Z95 = 1.959963984540054
 EFFECT_LABELS = ["незначимый", "слабый", "умеренный", "сильный"]
@@ -84,6 +89,90 @@ def _benjamini_hochberg(pvalues: np.ndarray) -> np.ndarray:
     adj = np.minimum.accumulate(adj[::-1])[::-1]
     adjusted[order] = np.clip(adj, 0, 1)
     return adjusted
+
+
+def _cochran_armitage(counts: np.ndarray, totals: np.ndarray, scores: np.ndarray) -> tuple[float, float]:
+    n = float(totals.sum())
+    r = float(counts.sum())
+    if n == 0 or r == 0 or r == n:
+        return (np.nan, np.nan)
+    p_bar = r / n
+    t = float((scores * (counts - totals * p_bar)).sum())
+    var = p_bar * (1 - p_bar) * float((totals * scores ** 2).sum() - (totals * scores).sum() ** 2 / n)
+    if var <= 0:
+        return (np.nan, np.nan)
+    z = t / np.sqrt(var)
+    p = 2 * (1 - stats.norm.cdf(abs(z)))
+    return (float(z), float(p))
+
+
+def _proportion_posthoc(
+    frame: pd.DataFrame,
+    group_col: str,
+    value_col: str,
+    min_orders: int,
+) -> pd.DataFrame:
+    data = frame.copy()
+    data[value_col] = pd.to_numeric(data[value_col], errors="coerce")
+    data = data[data[value_col].notna()]
+    if data.empty:
+        return pd.DataFrame()
+
+    total_n = len(data)
+    total_success = float(data[value_col].sum())
+    overall_rate = total_success / total_n
+
+    rows: list[dict[str, object]] = []
+    for segment, group in data.groupby(group_col):
+        n = len(group)
+        if n < min_orders:
+            continue
+        success = float(group[value_col].sum())
+        rate = success / n
+        rest_n = total_n - n
+        rest_success = total_success - success
+        contingency = np.array([[success, n - success], [rest_success, rest_n - rest_success]])
+        chi2, p, _, _ = stats.chi2_contingency(contingency)
+        ci_low, ci_high = _wilson_ci(success, n)
+        rows.append({
+            group_col: segment,
+            "orders": n,
+            "rate": round(rate, 4),
+            "rate_ci_low": round(ci_low, 4),
+            "rate_ci_high": round(ci_high, 4),
+            "overall_rate": round(overall_rate, 4),
+            "rate_diff": round(rate - overall_rate, 4),
+            "direction": "выше среднего" if rate > overall_rate else "ниже среднего",
+            "statistic": round(float(chi2), 4),
+            "p_value": _format_pvalue(p),
+        })
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+    result["p_value_adjusted"] = _benjamini_hochberg(result["p_value"].to_numpy())
+    result["significant"] = result["p_value_adjusted"] < 0.05
+    return result.sort_values("rate_diff", ascending=False).round(6)
+
+
+def run_category_posthoc(df: pd.DataFrame, output_dir: Path = TABLES_DIR, min_orders: int = 100) -> pd.DataFrame:
+    reviewed = df[df["is_bad_review"].notna()]
+    result = _proportion_posthoc(reviewed, "product_category_name", "is_bad_review", min_orders)
+    if not result.empty:
+        path = output_dir / "category_posthoc.csv"
+        result.to_csv(path, index=False)
+        print(f"Saved {path}")
+    return result
+
+
+def run_state_posthoc(df: pd.DataFrame, output_dir: Path = TABLES_DIR, min_orders: int = 100) -> pd.DataFrame:
+    delivered = df[(pd.to_numeric(df["is_delivered"], errors="coerce") == 1) & df["is_delayed"].notna()]
+    result = _proportion_posthoc(delivered, "customer_state", "is_delayed", min_orders)
+    if not result.empty:
+        path = output_dir / "state_posthoc.csv"
+        result.to_csv(path, index=False)
+        print(f"Saved {path}")
+    return result
 
 
 def _interpret(row: pd.Series) -> str:
@@ -332,6 +421,49 @@ def run_hypothesis_tests(db_path: Path = DB_PATH, output_dir: Path = TABLES_DIR)
                 "effect_magnitude": _magnitude(v),
                 "p_value": _format_pvalue(p),
             })
+
+    buckets = delivered.copy()
+    buckets["delay_bucket"] = delay_bucket_series(buckets)
+    buckets = buckets[buckets["delay_bucket"].notna() & buckets["is_bad_review"].notna()]
+    if not buckets.empty:
+        score_map = {label: i for i, label in enumerate(DELAY_BUCKET_LABELS)}
+        buckets = buckets.assign(bucket_score=buckets["delay_bucket"].map(score_map).astype(float))
+        counts = np.array([
+            buckets.loc[buckets["delay_bucket"] == label, "is_bad_review"].sum()
+            for label in DELAY_BUCKET_LABELS
+        ], dtype=float)
+        totals = np.array([
+            int((buckets["delay_bucket"] == label).sum())
+            for label in DELAY_BUCKET_LABELS
+        ], dtype=float)
+        scores = np.arange(len(DELAY_BUCKET_LABELS), dtype=float)
+        z, p = _cochran_armitage(counts, totals, scores)
+        if not pd.isna(p):
+            rho, _ = stats.spearmanr(buckets["bucket_score"], buckets["is_bad_review"])
+            rate_no_delay = float(buckets.loc[buckets["delay_bucket"] == DELAY_BUCKET_LABELS[0], "is_bad_review"].mean())
+            rate_max_delay = float(buckets.loc[buckets["delay_bucket"] == DELAY_BUCKET_LABELS[-1], "is_bad_review"].mean())
+            rows.append({
+                "hypothesis": "H8: вероятность плохого отзыва растёт с длительностью задержки",
+                "test": "Cochran-Armitage trend test",
+                "scope": "доставленные заказы с отзывом, по корзинам длительности задержки",
+                "metric_1": "bad_review_rate_no_delay",
+                "value_1": rate_no_delay,
+                "ci_low_1": np.nan,
+                "ci_high_1": np.nan,
+                "metric_2": "bad_review_rate_14plus",
+                "value_2": rate_max_delay,
+                "ci_low_2": np.nan,
+                "ci_high_2": np.nan,
+                "n_observations": int(totals.sum()),
+                "statistic": float(z),
+                "effect_size_name": "Spearman rho (корзина vs плохой отзыв)",
+                "effect_size": float(rho),
+                "effect_magnitude": _magnitude(rho),
+                "p_value": _format_pvalue(p),
+            })
+
+    run_category_posthoc(df, output_dir)
+    run_state_posthoc(df, output_dir)
 
     seller_tests = run_seller_within_category_tests(read_order_seller(db_path), output_dir)
     if not seller_tests.empty:

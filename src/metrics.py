@@ -107,6 +107,95 @@ def aggregate_segment(df: pd.DataFrame, group_col: str, min_orders: int = 30) ->
     return result.sort_values(["bad_review_rate", "orders"], ascending=[False, False]).round(4)
 
 
+DELAY_BUCKET_LABELS = ["Нет задержки", "1-3 дня", "4-7 дней", "8-14 дней", "14+ дней"]
+DELAY_BUCKET_BINS = [-np.inf, 0, 3, 7, 14, np.inf]
+DELAY_STAGE_LABELS = [
+    "Поздняя передача продавцом",
+    "Долгая транспортировка",
+    "Оба этапа",
+    "Другое",
+]
+
+
+def delay_bucket_series(df: pd.DataFrame) -> pd.Series:
+    delay = pd.to_numeric(df.get("delay_days"), errors="coerce")
+    delivered = pd.to_numeric(df.get("is_delivered"), errors="coerce")
+    bucket = pd.cut(delay, bins=DELAY_BUCKET_BINS, labels=DELAY_BUCKET_LABELS)
+    bucket = bucket.astype("object")
+    bucket[(delivered != 1) | delay.isna()] = np.nan
+    return pd.Categorical(bucket, categories=DELAY_BUCKET_LABELS, ordered=True)
+
+
+def delay_bucket_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    data = df.copy()
+    data["delay_bucket"] = delay_bucket_series(data)
+    data = data[data["delay_bucket"].notna()].copy()
+    if data.empty:
+        return pd.DataFrame()
+    data["is_bad_review"] = pd.to_numeric(data["is_bad_review"], errors="coerce")
+    data["review_score"] = pd.to_numeric(data["review_score"], errors="coerce")
+
+    rows: list[dict[str, object]] = []
+    for bucket in DELAY_BUCKET_LABELS:
+        group = data[data["delay_bucket"] == bucket]
+        reviewed = group[group["is_bad_review"].notna()]
+        n_reviewed = len(reviewed)
+        bad = float(reviewed["is_bad_review"].sum())
+        rate = bad / n_reviewed if n_reviewed else np.nan
+        ci_low, ci_high = _wilson_ci(bad, n_reviewed)
+        rows.append({
+            "delay_bucket": bucket,
+            "orders": int(group["order_id"].nunique()),
+            "reviewed_orders": int(n_reviewed),
+            "bad_review_rate": rate,
+            "bad_review_rate_ci_low": ci_low,
+            "bad_review_rate_ci_high": ci_high,
+            "avg_review_score": float(reviewed["review_score"].mean()) if n_reviewed else np.nan,
+        })
+    return pd.DataFrame(rows).round(4)
+
+
+def delay_stage_breakdown(df: pd.DataFrame) -> pd.DataFrame:
+    data = df.copy()
+    data["is_delayed"] = pd.to_numeric(data["is_delayed"], errors="coerce")
+    seller_over = pd.to_numeric(data.get("seller_overrun_days"), errors="coerce")
+    transit_over = pd.to_numeric(data.get("transit_overrun_days"), errors="coerce")
+    data = data[(data["is_delayed"] == 1) & seller_over.notna() & transit_over.notna()].copy()
+    if data.empty:
+        return pd.DataFrame()
+    seller_over = pd.to_numeric(data["seller_overrun_days"], errors="coerce")
+    transit_over = pd.to_numeric(data["transit_overrun_days"], errors="coerce")
+    data["delay_stage"] = np.select(
+        [
+            (seller_over > 0) & (transit_over > 0),
+            (seller_over > 0) & (transit_over <= 0),
+            (transit_over > 0) & (seller_over <= 0),
+        ],
+        ["Оба этапа", "Поздняя передача продавцом", "Долгая транспортировка"],
+        default="Другое",
+    )
+    data["is_bad_review"] = pd.to_numeric(data["is_bad_review"], errors="coerce")
+    data["review_score"] = pd.to_numeric(data["review_score"], errors="coerce")
+    data["delay_days"] = pd.to_numeric(data["delay_days"], errors="coerce")
+
+    total = len(data)
+    rows: list[dict[str, object]] = []
+    for stage in DELAY_STAGE_LABELS:
+        group = data[data["delay_stage"] == stage]
+        if group.empty:
+            continue
+        reviewed = group[group["is_bad_review"].notna()]
+        rows.append({
+            "delay_stage": stage,
+            "delayed_orders": int(len(group)),
+            "share_of_delayed": round(len(group) / total, 4) if total else np.nan,
+            "avg_delay_days": round(float(group["delay_days"].mean()), 2),
+            "bad_review_rate": round(float(reviewed["is_bad_review"].mean()), 4) if len(reviewed) else np.nan,
+            "avg_review_score": round(float(reviewed["review_score"].mean()), 4) if len(reviewed) else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
 def aggregate_sellers(seller_df: pd.DataFrame, min_orders: int = 30) -> pd.DataFrame:
     if seller_df.empty:
         return seller_df
@@ -245,6 +334,14 @@ def save_metrics(db_path: Path = DB_PATH, output_dir: Path = TABLES_DIR) -> None
         "seller_state_metrics.csv": aggregate_segment(df, "seller_state", min_orders=30),
         "monthly_metrics.csv": calculate_monthly_metrics(df),
     }
+
+    delay_buckets = delay_bucket_metrics(df)
+    if not delay_buckets.empty:
+        outputs["delay_bucket_metrics.csv"] = delay_buckets
+
+    delay_stages = delay_stage_breakdown(df)
+    if not delay_stages.empty:
+        outputs["delay_stage_breakdown.csv"] = delay_stages
 
     seller_df = read_seller_mart(db_path)
     seller_metrics = aggregate_sellers(seller_df, min_orders=30)

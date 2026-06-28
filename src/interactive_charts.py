@@ -6,6 +6,12 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from src.metrics import (
+    DELAY_BUCKET_LABELS,
+    delay_bucket_metrics,
+    delay_stage_breakdown,
+)
+
 PLOTLY_CONFIG = {
     "displayModeBar": True,
     "displaylogo": False,
@@ -43,6 +49,10 @@ def prepare_orders_mart(df: pd.DataFrame) -> pd.DataFrame:
         "delivery_time_days",
         "delay_days",
         "freight_share",
+        "handover_time_days",
+        "transit_time_days",
+        "seller_overrun_days",
+        "transit_overrun_days",
     ]:
         if column in result.columns:
             result[column] = pd.to_numeric(result[column], errors="coerce")
@@ -80,7 +90,7 @@ def prepare_orders_mart(df: pd.DataFrame) -> pd.DataFrame:
 
 def _format_pct(value: float | int | None) -> str:
     if value is None or pd.isna(value):
-        return "—"
+        return "-"
     return f"{value * 100:.1f}%"
 
 
@@ -615,6 +625,93 @@ def build_payment_type_figure(df: pd.DataFrame) -> go.Figure:
     return add_title(fig, "Метрики по способу оплаты")
 
 
+def build_delay_bucket_figure(df: pd.DataFrame) -> go.Figure:
+    data = delay_bucket_metrics(df)
+    if data.empty:
+        return add_title(go.Figure(), "Плохие отзывы по длительности задержки", "Нет данных для выбранных фильтров.")
+    data = data[data["delay_bucket"].isin(DELAY_BUCKET_LABELS)]
+
+    err_plus = (data["bad_review_rate_ci_high"] - data["bad_review_rate"]).clip(lower=0)
+    err_minus = (data["bad_review_rate"] - data["bad_review_rate_ci_low"]).clip(lower=0)
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Bar(
+            x=data["delay_bucket"],
+            y=data["bad_review_rate"],
+            name="Доля плохих отзывов",
+            marker_color=COLOR_BAD,
+            error_y={"type": "data", "symmetric": False, "array": err_plus, "arrayminus": err_minus},
+            text=data["bad_review_rate"].map(lambda x: f"{x:.1%}"),
+            textposition="outside",
+            customdata=data["reviewed_orders"],
+            hovertemplate="Задержка: %{x}<br>Плохие отзывы: %{y:.1%}<br>Отзывов: %{customdata:,.0f}<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=data["delay_bucket"],
+            y=data["avg_review_score"],
+            name="Средняя оценка",
+            mode="lines+markers",
+            line={"color": COLOR_GOOD, "width": 3},
+            hovertemplate="Задержка: %{x}<br>Средняя оценка: %{y:.2f}<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    fig.update_yaxes(title_text="Доля плохих отзывов", tickformat=".0%", secondary_y=False)
+    fig.update_yaxes(title_text="Средняя оценка", range=[0, 5.2], secondary_y=True)
+    fig.update_xaxes(title_text="Длительность задержки")
+    return add_title(
+        fig,
+        "Плохие отзывы по длительности задержки",
+        "Чем дольше задержка, тем выше доля негатива (планки - 95% доверительный интервал).",
+    )
+
+
+def build_delay_attribution_figure(df: pd.DataFrame) -> go.Figure:
+    data = delay_stage_breakdown(df)
+    if data.empty:
+        return add_title(go.Figure(), "Где возникает задержка", "Нет задержанных заказов для выбранных фильтров.")
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Bar(
+            x=data["delay_stage"],
+            y=data["share_of_delayed"],
+            name="Доля задержанных заказов",
+            marker_color=COLOR_NEUTRAL,
+            text=data.apply(lambda r: f"{r['share_of_delayed']:.0%} ({r['delayed_orders']:,.0f})", axis=1),
+            textposition="outside",
+            hovertemplate="%{x}<br>Доля задержек: %{y:.1%}<br>Средняя задержка: %{customdata:.1f} дн.<extra></extra>",
+            customdata=data["avg_delay_days"],
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=data["delay_stage"],
+            y=data["bad_review_rate"],
+            name="Доля плохих отзывов",
+            mode="lines+markers+text",
+            text=data["bad_review_rate"].map(lambda x: f"{x:.1%}"),
+            textposition="top center",
+            line={"color": COLOR_BAD, "width": 3},
+            hovertemplate="%{x}<br>Плохие отзывы: %{y:.1%}<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    fig.update_yaxes(title_text="Доля задержанных заказов", tickformat=".0%", secondary_y=False)
+    fig.update_yaxes(title_text="Доля плохих отзывов", tickformat=".0%", secondary_y=True)
+    fig.update_xaxes(title_text="Источник задержки")
+    return add_title(
+        fig,
+        "Где возникает задержка: продавец или транспорт",
+        "Разложение задержанных заказов по этапу-источнику задержки.",
+    )
+
+
 def build_seller_customer_heatmap(df: pd.DataFrame, min_orders: int = 30) -> go.Figure:
     data = (
         df[df["is_delivered"] == 1]
@@ -800,7 +897,7 @@ def build_seller_quality_scatter(df: pd.DataFrame, min_orders: int = 30) -> go.F
     return add_title(
         fig,
         "Качество продавцов: задержки и плохие отзывы",
-        "Каждая точка — продавец. Размер — число заказов.",
+        "Каждая точка - продавец. Размер - число заказов.",
     )
 
 
